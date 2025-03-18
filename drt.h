@@ -91,6 +91,7 @@
 #endif
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -162,7 +163,7 @@ typedef double      f64;
 # define type_of                typeof
 # define offset_of              __builtin_offsetof
 # define inline_fn              static inline __attribute__((always_inline))
-# define struct_packed          struct  
+# define struct_packed          struct
 # define struct_packed_end      __attribute__((packed))
 #endif
 
@@ -202,6 +203,15 @@ typedef double      f64;
 # define max(a,b)   ((a) > (b) ? (a) : (b))
 #endif
 
+// --- Ascii Colors for Terminal
+#define ANSI_COLOR_RED          "\x1b[31m"
+#define ANSI_COLOR_GREEN        "\x1b[32m"
+#define ANSI_COLOR_YELLOW       "\x1b[33m"
+#define ANSI_COLOR_BLUE         "\x1b[34m"
+#define ANSI_COLOR_MAGENTA      "\x1b[35m"
+#define ANSI_COLOR_CYAN         "\x1b[36m"
+#define ANSI_COLOR_RESET        "\x1b[0m"
+
 ////////////////////////////////////////////////////////////////////////////////
 // Base Functions
 inline_fn usize align_to        (usize value, usize alignment) { return (value + (alignment - 1)) & ~(alignment - 1); }
@@ -231,7 +241,7 @@ struct arena
 };
 
 typedef struct arena_params arena_params;
-struct arena_params 
+struct arena_params
 {
     usize reserve_size;
     usize commit_size;
@@ -240,6 +250,9 @@ struct arena_params
 arena *arena_vm_alloc_params (arena_params *params);
 void  *arena_push_no_zero    (arena *arena, usize size);
 void  *arena_push            (arena *arena, usize size);
+
+inline_fn void arena_pop   (arena *a, usize pos) { a->pos = pos; }
+inline_fn void arena_clear (arena *a)            { a->pos = sizeof(arena); }
 
 #define arena_vm_alloc(...)                     arena_vm_alloc_params(&(arena_params){.reserve_size=GB(1), .commit_size=KB(64), __VA_ARGS__})
 #define arena_push_struct(arena, type)          (type *)arena_push(arena, sizeof(type))
@@ -267,6 +280,7 @@ static inline bool is_upper        (char c) { return (c >= 'A' && c <= 'Z'); }
 static inline bool is_lower        (char c) { return (c >= 'a' && c <= 'z'); }
 static inline bool is_ascii        (char c) { return (c >= 0 && c <= 127); }
 static inline bool is_numeric      (char c) { return (is_digit(c) || c == '-' || c == '+' || c == 'e' || c == 'E' || c == '.'); }
+static inline bool is_printable    (char c) { return (c >= 32 && c <= 126); }
 
 static inline char to_upper (char c) { return (is_lower(c) ? c - 32 : c); }
 static inline char to_lower (char c) { return (is_upper(c) ? c + 32 : c); }
@@ -280,8 +294,8 @@ struct string
     usize len;
 };
 
-static inline string str          (u8 *s, usize len) { string res; res.data = s; res.len  = len; return res; }
-static inline bool   string_empty (string s)         { return s.len == 0; }
+inline_fn string str          (u8 *s, usize len) { string res; res.data = s; res.len  = len; return res; }
+inline_fn bool   string_empty (string s)         { return s.len == 0; }
 
 #define SPRI            "%.*s"
 #define from_cstr(s)    str((u8 *)s, cstring_len(s))
@@ -290,14 +304,16 @@ static inline bool   string_empty (string s)         { return s.len == 0; }
 #define to_cstr(s)      (char *)s.data
 
 // --- C-String
-usize cstring_len(char *s);
-void  cstring_copy(char *dst, char *src, usize len);
+usize cstring_len  (char *s);
+void  cstring_copy (char *dst, char *src, usize len);
+bool  cstr_eq      (char *a, char *b);
 
 string string_skip        (string s, usize el);
 string string_trim_start  (string s);
 string string_trim_end    (string s);
 string string_trim        (string s);
 bool   string_starts_with (string s, string pre);
+bool   string_equal       (string a, string b);
 
 // --- String Conversion
 static inline f32 f32_from_str (string s) { return strtof(to_cstr(s), NULL); }
@@ -335,8 +351,131 @@ void         string_list_push_node(string_list *list, string_node *node);
 void         string_list_push(arena *arena, string_list *list, string str);
 string      *string_list_to_array(arena *arena, string_list *list);
 
+string       string_list_concat(arena *arena, string_list *list, string sep);
+
 string_list  string_split(arena *arena, string s, char *delims, usize delim_count);
 string_list *text_get_lines(arena *arena, string text);
+
+////////////////////////////////////////////////////////////////////////////////
+// Logging
+typedef int (*log_write_fn)(const char *msg, usize len);
+
+typedef enum {
+    LOG_NONE,
+    LOG_FATAL,
+    LOG_ERROR,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG,
+    LOG_TRACE,
+    LOG_LEVEL_COUNT  // Total number of log levels
+} log_level;
+
+typedef struct log_level_fmt log_level_fmt;
+struct log_level_fmt {
+    char *level_str;   // Log level as a string
+    char *color_str;   // Color string for the log level
+};
+
+static const log_level_fmt __drt_log_level_formats[LOG_LEVEL_COUNT] = {
+    [LOG_NONE]  = {"NONE",  ""},
+    [LOG_FATAL] = {"FATAL", ANSI_COLOR_RED},
+    [LOG_ERROR] = {"ERROR", ANSI_COLOR_RED},
+    [LOG_WARN]  = {"WARN",  ANSI_COLOR_YELLOW},
+    [LOG_INFO]  = {"INFO",  ANSI_COLOR_GREEN},
+    [LOG_DEBUG] = {"DEBUG", ANSI_COLOR_CYAN},
+    [LOG_TRACE] = {"TRACE", ANSI_COLOR_MAGENTA},
+};
+
+static u32 logger_log_levelstr_to_enum(char *str)
+{
+    if (cstr_eq(str, "fatal"))   return LOG_FATAL;
+    if (cstr_eq(str, "error"))   return LOG_ERROR;
+    if (cstr_eq(str, "warn" ))   return LOG_WARN;
+    if (cstr_eq(str, "info" ))   return LOG_INFO;
+    if (cstr_eq(str, "debug"))   return LOG_DEBUG;
+    if (cstr_eq(str, "trace"))   return LOG_TRACE;
+
+    return LOG_NONE;
+}
+
+typedef struct logger logger;
+struct logger
+{
+    log_level     level;
+    bool          ts_on;
+    bool          ctx_info_on; // line and file info
+    log_write_fn  write;
+    char         *title;
+};
+
+global_variable logger g_drt_logger = {
+    LOG_INFO,
+    false,
+    false,
+    NULL,
+    "drt"
+};
+
+inline_fn void logger_log_set_level (logger *log, log_level level)    { log->level = level; }
+inline_fn void logger_log_set_ts    (logger *log, bool enable_ts)     { log->ts_on = enable_ts; }
+inline_fn void logger_log_set_write (logger *log, log_write_fn write) { log->write = write; }
+inline_fn void logger_log_set_title (logger *log, char *title)        { log->title = title; }
+inline_fn void logger_log_set_ctx   (logger *log, bool enable_ctx)    { log->ctx_info_on = enable_ctx; }
+
+int
+__drt_logger_log(u32 level, const char *sub, const char *fmt, ...)
+{
+    if (level > g_drt_logger.level || g_drt_logger.write == NULL) return 0;
+
+    char buf[4096]; memory_zero_array(buf);
+    size_t max_len = sizeof(buf);
+    size_t n       = 0;
+
+    n += snprintf(buf, max_len, "[");
+
+    if (g_drt_logger.title)     n += snprintf(buf+n, max_len-n, "%s ", g_drt_logger.title);
+
+    if (g_drt_logger.ts_on) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm *tm = localtime(&ts.tv_sec);
+
+        n += strftime(buf+n, max_len-n, "%Y-%m-%d %H:%M:%S", tm);
+        n += snprintf(buf+n, max_len-n, ".%09ld ", ts.tv_nsec);
+    }
+
+    log_level_fmt lvl_fmt = __drt_log_level_formats[level];
+    if (sub) n += snprintf(buf+n, max_len-n, "%s%5s%s %s ", lvl_fmt.color_str, lvl_fmt.level_str, ANSI_COLOR_RESET, sub);
+    else     n += snprintf(buf+n, max_len-n, "%s%5s%s ", lvl_fmt.color_str, lvl_fmt.level_str, ANSI_COLOR_RESET);
+
+    n += snprintf(buf+n, max_len-n, "] ");
+
+    va_list args;
+    va_start(args, fmt);
+    n += vsnprintf(buf+n, max_len-n, fmt, args);
+    va_end(args);
+
+    return g_drt_logger.write(buf, n);
+}
+
+#define logger_set_level(level)  logger_log_set_level(&g_drt_logger, level)
+#define logger_set_ts(enable_ts) logger_log_set_ts(&g_drt_logger, enable_ts)
+#define logger_set_write(write)  logger_log_set_write(&g_drt_logger, write)
+#define logger_set_title(title)  logger_log_set_title(&g_drt_logger, title)
+#define logger_set_ctx(enable)   logger_log_set_ctx(&g_drt_logger, enable)
+
+#define debug(fmt, ...)     __drt_logger_log(LOG_DEBUG, NULL, fmt, ##__VA_ARGS__)
+#define info(fmt, ...)      __drt_logger_log(LOG_INFO,  NULL, fmt, ##__VA_ARGS__)
+#define warn(fmt, ...)      __drt_logger_log(LOG_WARN,  NULL, fmt, ##__VA_ARGS__)
+#define error(fmt, ...)     __drt_logger_log(LOG_ERROR, NULL, fmt, ##__VA_ARGS__)
+
+#define debug_ctx(fmt, ...)     __drt_logger_log(LOG_DEBUG, NULL, "(%s:%d)" # fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+
+#define debug_sys(sys, fmt, ...)     __drt_logger_log(LOG_DEBUG, sys, fmt, ##__VA_ARGS__)
+#define info_sys(sys, fmt, ...)      __drt_logger_log(LOG_INFO,  sys, fmt, ##__VA_ARGS__)
+#define warn_sys(sys, fmt, ...)      __drt_logger_log(LOG_WARN,  sys, fmt, ##__VA_ARGS__)
+#define error_sys(sys, fmt, ...)     __drt_logger_log(LOG_ERROR, sys, fmt, ##__VA_ARGS__)
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -454,6 +593,10 @@ int           fs_file_write (fs_file *file, void *buffer, usize size);
 fs_file_error fs_file_close (fs_file *file);
 
 string fs_read_entire_file(string filename);
+
+////////////////////////////////////////////////////////////////////////////////
+// Environment
+string os_get_env(string name);
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -676,11 +819,7 @@ arena_push(arena *arena, usize size)
     return ptr;
 }
 
-void
-arena_pop(arena *arena, usize pos) 
-{
-    arena->pos = pos;
-}
+
 
 temp_arena
 temp_arena_begin(arena *arena)
@@ -711,6 +850,20 @@ void
 cstring_copy(char *dst, char *src, usize len)
 {
     while (len--)    *dst++ = *src++;
+}
+
+bool
+cstr_eq(char *a, char *b)
+{
+    usize a_len = cstring_len(a);
+    usize b_len = cstring_len(b);
+    if (a_len != b_len)    return false;
+
+    for (usize i = 0; i < a_len; i++) {
+        if (a[i] != b[i])    return false;
+    }
+
+    return true;
 }
 
 string
@@ -753,6 +906,12 @@ string_starts_with(string s, string pre)
     return true;
 }
 
+bool
+string_equal(string a, string b)
+{
+    return string_starts_with(a, b) && a.len == b.len;
+}
+
 string_list
 str_list()
 {
@@ -781,6 +940,29 @@ string_list_push(arena *arena, string_list *list, string str)
     string_node *node = arena_push_struct(arena, string_node);
     node->s = str;
     string_list_push_node(list, node);
+}
+
+string
+string_list_concat(arena *arena, string_list *list, string sep)
+{
+    usize total_len = 0;
+    string_node *n;
+    string_list_foreach(list, n) {
+        total_len += n->s.len + sep.len;
+    }
+
+    total_len -= sep.len;
+
+    u8 *data  = arena_push(arena, total_len);
+    usize pos = 0;
+    string_list_foreach(list, n) {
+        memory_copy(data + pos, n->s.data, n->s.len);
+        pos += n->s.len;
+        memory_copy(data + pos, sep.data, sep.len);
+        pos += sep.len;
+    }
+
+    return str(data, total_len);
 }
 
 string_list
@@ -1005,12 +1187,12 @@ FS_OPEN_PROC()
     int os_mode = 0;
     switch (mode & FILE_MODE_MODES) {
     case FILE_MODE_READ:    os_mode = O_RDONLY; break;
-    case FILE_MODE_WRITE:   os_mode = O_WRONLY | O_CREAT | O_TRUNC; break; 
+    case FILE_MODE_WRITE:   os_mode = O_WRONLY | O_CREAT | O_TRUNC; break;
     case FILE_MODE_APPEND:  os_mode = O_WRONLY | O_CREAT | O_APPEND; break;
 
-    case FILE_MODE_READ   | FILE_MODE_RW: os_mode = O_RDWR; break; 
+    case FILE_MODE_READ   | FILE_MODE_RW: os_mode = O_RDWR; break;
     case FILE_MODE_WRITE  | FILE_MODE_RW: os_mode = O_RDWR | O_CREAT | O_TRUNC; break;
-    case FILE_MODE_APPEND | FILE_MODE_RW: os_mode = O_RDWR | O_CREAT | O_APPEND; break; 
+    case FILE_MODE_APPEND | FILE_MODE_RW: os_mode = O_RDWR | O_CREAT | O_APPEND; break;
     default: break;
     }
 
@@ -1029,19 +1211,19 @@ FS_OPEN_PROC()
     return result;
 }
 
-FS_READ_AT_PROC() 
+FS_READ_AT_PROC()
 {
     lseek(h, offset, SEEK_SET);
     return read(h, buffer, size);
 }
 
-FS_WRITE_AT_PROC() 
+FS_WRITE_AT_PROC()
 {
     lseek(h, offset, SEEK_SET);
     return write(h, buffer, size);
 }
 
-FS_SEEK_PROC() 
+FS_SEEK_PROC()
 {
     int whence = 0;
     switch (type) {
@@ -1115,6 +1297,20 @@ fs_read_entire_file_alloc(string filename, allocator *a)
         }
     }
 #endif
+    return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Environment
+string
+os_get_env(string name)
+{
+    string result; memory_zero_struct(&result);
+    char *value = getenv(to_cstr(name));
+    if (value) {
+        result.data = (u8 *)value;
+        result.len  = strlen(value);
+    }
     return result;
 }
 

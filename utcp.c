@@ -152,7 +152,7 @@ eth_etype_to_string(u16 etype)
     }
 }
 
-static inline void 
+static inline void
 print_eth_hdr(eth_hdr *hdr) {
     printf("ETH: %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x [%s (0x%04x)]\n",
            hdr->src.addr[0], hdr->src.addr[1], hdr->src.addr[2], hdr->src.addr[3], hdr->src.addr[4], hdr->src.addr[5],
@@ -523,40 +523,45 @@ route_list_remove(route_list *list, route_entry *entry)
 typedef struct tcp_hdr tcp_hdr;
 struct_packed tcp_hdr
 {
-    u16     src_port;
-    u16     dst_port;
-    u32     seq;
-    u32     ack_seq;
-    u8      reserved : 4;
-    u8      data_offset : 4; // The number of 32-bit words in the TCP header
-    u8      flags;
-    u16     window;
-    u16     csum;
-    u16     urg_ptr;
+    u16     sport;      // Source port
+    u16     dport;      // Destination port
+    u32     seq;        // Sequence number
+    u32     ack;        // Acknowledgment number
+#if defined(__LITTLE_ENDIAN__)
+    u8      reserved:4; // Reserved for future use (unused)
+    u8      data_off:4; // The number of 32-bit words in the TCP header
+#else // __BIG_ENDIAN__
+    u8      reserved:4;
+    u8      data_off:4;
+#endif
+    u8      flags;      // TCP flags: CWR, ECE, URG, ACK, PSH, RST, SYN, FIN
+    u16     window;     // Advertised window size
+    u16     csum;       // Checksum
+    u16     urp;        // Urgent pointer
 } struct_packed_end;
 
 inline_fn void
 tcp_header_net_to_host(tcp_hdr *hdr)
 {
-    hdr->src_port = net_to_host_u16(hdr->src_port);
-    hdr->dst_port = net_to_host_u16(hdr->dst_port);
-    hdr->seq      = net_to_host_u32(hdr->seq);
-    hdr->ack_seq  = net_to_host_u32(hdr->ack_seq);
-    hdr->window   = net_to_host_u16(hdr->window);
-    hdr->csum     = net_to_host_u16(hdr->csum);
-    hdr->urg_ptr  = net_to_host_u16(hdr->urg_ptr);
+    hdr->sport   = net_to_host_u16(hdr->sport);
+    hdr->dport   = net_to_host_u16(hdr->dport);
+    hdr->seq     = net_to_host_u32(hdr->seq);
+    hdr->ack     = net_to_host_u32(hdr->ack);
+    hdr->window  = net_to_host_u16(hdr->window);
+    hdr->csum    = net_to_host_u16(hdr->csum);
+    hdr->urp     = net_to_host_u16(hdr->urp);
 }
 
 inline_fn void
 tcp_header_host_to_net(tcp_hdr *hdr)
 {
-    hdr->src_port = host_to_net_u16(hdr->src_port);
-    hdr->dst_port = host_to_net_u16(hdr->dst_port);
+    hdr->sport = host_to_net_u16(hdr->sport);
+    hdr->dport = host_to_net_u16(hdr->dport);
     hdr->seq      = host_to_net_u32(hdr->seq);
-    hdr->ack_seq  = host_to_net_u32(hdr->ack_seq);
+    hdr->ack  = host_to_net_u32(hdr->ack);
     hdr->window   = host_to_net_u16(hdr->window);
     hdr->csum     = host_to_net_u16(hdr->csum);
-    hdr->urg_ptr  = host_to_net_u16(hdr->urg_ptr);
+    hdr->urp  = host_to_net_u16(hdr->urp);
 }
 
 #define TCP_FLAG_FIN    0x01
@@ -754,14 +759,14 @@ snprint_tcp_flags(u8 flags, char buf[16])
 void print_tcp_hdr(tcp_hdr *hdr) {
     char flags[16];
     snprint_tcp_flags(hdr->flags, flags);
-    printf("TCP: %d -> %d [%s] SEQ: %u ACK: %u OFF: %d CSUM: 0x%04x URG: %d\n", 
-           hdr->src_port, hdr->dst_port,
+    printf("TCP: %d -> %d [%s] SEQ: %u ACK: %u OFF: %d CSUM: 0x%04x URG: %d\n",
+           hdr->sport, hdr->dport,
            flags,
-           hdr->seq, hdr->ack_seq,
-           hdr->data_offset, hdr->csum, hdr->urg_ptr 
+           hdr->seq, hdr->ack,
+           hdr->data_off, hdr->csum, hdr->urp
     );
 
-    if (hdr->data_offset > 5) {
+    if (hdr->data_off > 5) {
     }
 
     printf("\n");
@@ -799,13 +804,49 @@ static const char *s_tcp_state_str[] = {
 
 ///////////////////////////////////////////////////////////////////////////////
 // # TCP Control Block
+//
+// ## Example of sending sequence space
+//
+//                                  snd_wnd=6; offered window
+//                         <---   advertised window by receiver   --->
+//                                               <-- usable window -->
+//                         +---------------------+-------------------+
+//    1      2      3      |   4       5      6  :    7     8     9  |   10   11  ...
+//                         +---------------------+-------------------+
+//                         |                     |                   | can't send until
+//                         |<- sent, not acked ->|                   |<--------------->
+//                         |     ^               |                   |   window moves
+//    -- sent and acked -->|     |               |<- can send ASAP ->|
+//                               |                       ^
+//                             snd_una=4                 |
+//                        oldest unacknowledged       snd_nxt=7
+//                           sequence number       next send sequence number
+//                                                       ^
+//                                                       |
+//                                                    snd_max=7
+//                                                highest sequence number sent
+// ## Example of receiving sequence space
+//
+//                               rcv_wnd=6; receive window
+//                         <--- advertised window to sender --->
+//                         +-----------------------------------------+
+//    1      2      3      |   4       5      6       7     8     9  |   10   11  ...
+//                         +-----------------------------------------+
+//                         |                                         |  future sequence numbers
+//    old sequence numbers |                                         |----------------------------->
+//   --------------------->|    ^                                        not yet allowed
+//    that TCP acked            |                                           ^
+//                           rcv_nxt=4                                      |
+//                       next sequence number                             rcv_adv=10
+//                           expected                                 highest advertised
+//                                                                    sequence number + 1
 
-typedef struct tcp_tcb tcp_tcb;
-struct tcp_tcb
+typedef struct tcp_cb tcp_cb;
+struct tcp_cb
 {
     // --- Doubly Linked List
-    tcp_tcb *next;
-    tcp_tcb *prev;
+    tcp_cb *next;
+    tcp_cb *prev;
 
     tcp_state state;
     bool passive;
@@ -830,6 +871,10 @@ struct tcp_tcb
     u32 rcv_up;  // Receive urgent pointer
     u32 irs;     // Initial receive sequence number
 
+    // Additional Variables
+    u32 rcv_adv; // Receive advertised window
+    u32 snd_max; // Highest sequence number sent
+
     // Window size
     u16 send_window;
     u16 recv_window;
@@ -846,12 +891,12 @@ struct tcp_tcb
 typedef struct tcp_tcb_list tcp_tcb_list;
 struct tcp_tcb_list
 {
-    tcp_tcb *head;
-    tcp_tcb *tail;
+    tcp_cb *head;
+    tcp_cb *tail;
     usize    count;
 };
 
-void 
+void
 print_tcp_tcb_list(tcp_tcb_list *list)
 {
     printf("TCP TCB List:\n");
@@ -860,8 +905,8 @@ print_tcp_tcb_list(tcp_tcb_list *list)
     } else {
         int i = 0;
         char local_ip_str[16], remote_ip_str[16];
-        tcp_tcb *tcb = NULL;
-        char print_buf[256]; 
+        tcp_cb *tcb = NULL;
+        char print_buf[256];
         dllist_foreach(list, tcb) {
             memory_zero(print_buf, 256);
             ipv4_to_cstr(tcb->local_ip, local_ip_str);
@@ -874,29 +919,29 @@ print_tcp_tcb_list(tcp_tcb_list *list)
 
             if (tcb->state != TCP_STATE_ESTABLISHED)    snprintf(print_buf + n, sizeof(print_buf) - n, " (peerless)");
 
-            printf("%s\n", print_buf);    
+            printf("%s\n", print_buf);
         }
     }
 }
 
 void
-tcp_tcb_list_push(tcp_tcb_list *list, tcp_tcb *tcb)
+tcp_tcb_list_push(tcp_tcb_list *list, tcp_cb *tcb)
 {
     dllist_push(list, tcb);
     list->count += 1;
 }
 
-void 
-tcp_tcb_list_remove(tcp_tcb_list *list, tcp_tcb *tcb)
+void
+tcp_tcb_list_remove(tcp_tcb_list *list, tcp_cb *tcb)
 {
     dllist_remove(list, tcb);
     list->count -= 1;
 }
 
-tcp_tcb *
+tcp_cb *
 tcp_tcb_list_find(tcp_tcb_list *list, u16 local_port, u16 remote_port)
 {
-    tcp_tcb *result = NULL, *tcb = NULL; 
+    tcp_cb *result = NULL, *tcb = NULL;
     dllist_foreach(list, tcb) {
         if (tcb->local_port == local_port && tcb->remote_port == remote_port) {
             result = tcb;
@@ -906,10 +951,10 @@ tcp_tcb_list_find(tcp_tcb_list *list, u16 local_port, u16 remote_port)
     return result;
 }
 
-tcp_tcb *
+tcp_cb *
 tcp_tcb_list_find_local_peer(tcp_tcb_list *list, u32 local_ip, u16 local_port)
 {
-    tcp_tcb *result = NULL, *tcb = NULL; 
+    tcp_cb *result = NULL, *tcb = NULL;
     dllist_foreach(list, tcb) {
         if (tcb->local_ip == local_ip && tcb->local_port == local_port) {
             result = tcb;
@@ -945,7 +990,7 @@ struct mem_buf
     u32     l4_type;
 };
 
-static inline mem_buf 
+static inline mem_buf
 mem_buf_init(void *data, usize len, usize headroom)
 {
     mem_buf buf;
@@ -962,7 +1007,7 @@ mem_buf_init(void *data, usize len, usize headroom)
     return buf;
 }
 
-inline_fn void 
+inline_fn void
 mem_buf_clear(mem_buf *buf)
 {
     memory_zero(buf->data, buf->len);
@@ -988,9 +1033,9 @@ inline_fn void *mem_buf_buffer (mem_buf *buf) { return buf->data; }
 inline_fn void *mem_buf_start  (mem_buf *buf) { return buf->data + buf->start_off; }
 
 static inline void *
-mem_buf_reserve_backwards (mem_buf *buf, usize size) 
+mem_buf_reserve_backwards (mem_buf *buf, usize size)
 {
-    buf->start_off -= size; 
+    buf->start_off -= size;
     buf->used      += size;
     return buf->data + buf->start_off;
 }
@@ -1237,7 +1282,7 @@ print_route_table()
 global_variable arena *g_arena;
 global_variable bool g_running = true;
 
-global_variable tcp_tcb_list g_tcb_list; 
+global_variable tcp_tcb_list g_tcb_list;
 
 global_variable u32 device_ip = 0;
 global_variable eth_addr dev_eth_addr;
@@ -1264,13 +1309,53 @@ signal_handler(int signum)
 ///////////////////////////////////////////////////////////////////////////////
 // Temp Functions
 
-int tcp_in    (mem_buf *mbuf);
+// void
+// print_hex_dump(void *data, usize len)
+// {
+//     u8 *ptr = (u8 *)data;
+//     for (usize i = 0; i < len; i++) {
+//         printf("%02x ", ptr[i]);
+//         if ((i + 1) % 16 == 0) printf("\n");
+//     }
+//     printf("\n");
+// }
+
+void
+print_hex_dump(void *data, size_t len) {
+    unsigned char *ptr = (unsigned char *)data;
+    size_t i, j;
+
+    for (i = 0; i < len; i += 16) {
+        // Print the hex values
+        for (j = 0; j < 16; j++) {
+            if (i + j < len) {
+                printf("%02x ", ptr[i + j]);
+            } else {
+                printf("   ");
+            }
+        }
+
+        // Print the ASCII representation
+        printf(" | ");
+        for (j = 0; j < 16; j++) {
+            if (i + j < len) {
+                unsigned char c = ptr[i + j];
+                printf("%c", is_printable(c) ? c : '.');
+            } else {
+                printf(" ");
+            }
+        }
+        printf("\n");
+    }
+}
+
+int tcp_input (mem_buf *mbuf);
 int icmpv4_in (mem_buf *mbuf);
 int ipv4_in   (mem_buf *mbuf);
 int eth_in    (mem_buf *mbuf);
 
 // --- output
-int tcp_out  (mem_buf *mbuf);
+int tcp_out  (tcp_cb *tcb, mem_buf *mbuf);
 int ipv4_out (mem_buf *mbuf, u32 sip, u32 dip);
 int eth_out  (mem_buf *mbuf);
 
@@ -1279,7 +1364,7 @@ icmpv4_reply(mem_buf *mbuf, icmp4_hdr *icmp_req, usize len, u32 sip)
 {
     mem_buf_set_l4(mbuf, sizeof(icmp4_hdr));
     icmp4_hdr *icmp = mem_buf_reserve_l4(mbuf, sizeof(icmp4_hdr));
-    memory_copy(icmp, icmp_req, len); 
+    memory_copy(icmp, icmp_req, len);
     icmp->type = ICMP_TYPE_ECHO_REPLY;
     icmp->csum = 0;
     icmp->csum = icmp4_csum(icmp, len);
@@ -1289,11 +1374,11 @@ icmpv4_reply(mem_buf *mbuf, icmp4_hdr *icmp_req, usize len, u32 sip)
     return ipv4_out(mbuf, device_ip, sip);
 }
 
-int 
+int
 icmpv4_in(mem_buf *mbuf)
 {
     mem_buf_set_l4(mbuf, sizeof(icmp4_hdr));
-    icmp4_hdr *icmp = mem_buf_l4(mbuf, icmp4_hdr); 
+    icmp4_hdr *icmp = mem_buf_l4(mbuf, icmp4_hdr);
     switch (icmp->type) {
     case ICMP_TYPE_ECHO_REQUEST: {
         ip_hdr *ip   = mem_buf_l3(mbuf, ip_hdr);
@@ -1311,8 +1396,8 @@ icmpv4_in(mem_buf *mbuf)
 
 // Create a TCP syn packet and send it out
 //  - The TCB is updated with the new state and sequence numbers
-int 
-tcp_syn(mem_buf *mbuf, tcp_tcb *tcb)
+int
+tcp_syn(mem_buf *mbuf, tcp_cb *tcb)
 {
     // check if tcb is in the correct state
     if (tcb->state != TCP_STATE_CLOSED) {
@@ -1321,13 +1406,13 @@ tcp_syn(mem_buf *mbuf, tcp_tcb *tcb)
     }
 
     tcp_hdr *tcp = mem_buf_reserve_l4(mbuf, sizeof(tcp_hdr));
-    tcp->src_port    = tcb->local_port;
-    tcp->dst_port    = tcb->remote_port;
-    tcp->seq         = 100; // TODO(garbu): Randomize 
-    tcp->ack_seq     = 0;
-    tcp->data_offset = 5; // 20 bytes, no options
+    tcp->sport    = tcb->local_port;
+    tcp->dport    = tcb->remote_port;
+    tcp->seq         = 100; // TODO(garbu): Randomize
+    tcp->ack     = 0;
+    tcp->data_off = 5; // 20 bytes, no options
     tcp->csum        = 0;
-    tcp->urg_ptr     = 0;
+    tcp->urp     = 0;
     tcp->window      = 64000; // TODO(garbu): use a better value
     tcp->flags       = 0;
     TCP_HDR_SET_FLAG(tcp, TCP_FLAG_SYN);
@@ -1338,7 +1423,7 @@ tcp_syn(mem_buf *mbuf, tcp_tcb *tcb)
 
     u16 tcp_len = sizeof(tcp_hdr);
     tcp_ipv4_pseudo_hdr tcp_pseudo_hdr = {
-        .src_ip = host_to_net_u32(device_ip), 
+        .src_ip = host_to_net_u32(device_ip),
         .dst_ip = host_to_net_u32(tcb->remote_ip),
         .zero   = 0,
         .proto  = IP_PROTO_TCP,
@@ -1352,16 +1437,16 @@ tcp_syn(mem_buf *mbuf, tcp_tcb *tcb)
 }
 
 int
-tcp_synack(mem_buf *mbuf, tcp_tcb *tcb)
+tcp_synack(mem_buf *mbuf, tcp_cb *tcb)
 {
     tcp_hdr *tcp = mem_buf_reserve_l4(mbuf, sizeof(tcp_hdr));
-    tcp->src_port    = tcb->local_port;
-    tcp->dst_port    = tcb->remote_port; 
-    tcp->seq         = tcb->snd_nxt; 
-    tcp->ack_seq     = tcb->rcv_nxt;
-    tcp->data_offset = 5; // 20 bytes, no options
+    tcp->sport    = tcb->local_port;
+    tcp->dport    = tcb->remote_port;
+    tcp->seq         = tcb->snd_nxt;
+    tcp->ack     = tcb->rcv_nxt;
+    tcp->data_off = 5; // 20 bytes, no options
     tcp->csum        = 0;
-    tcp->urg_ptr     = 0;
+    tcp->urp     = 0;
     tcp->window      = tcb->recv_window;
     tcp->flags       = 0;
     TCP_HDR_SET_FLAG(tcp, TCP_FLAG_SYN | TCP_FLAG_ACK);
@@ -1369,14 +1454,14 @@ tcp_synack(mem_buf *mbuf, tcp_tcb *tcb)
     // TOOD(garbu): Add options?
 
     // TODO(garbu): Debug
-    printf("[TCP OUT] "); 
+    printf("[TCP OUT] ");
     print_tcp_hdr(tcp);
 
     tcp_header_host_to_net(tcp);
 
     u16 tcp_len = sizeof(tcp_hdr);
     tcp_ipv4_pseudo_hdr tcp_pseudo_hdr = {
-        .src_ip = host_to_net_u32(device_ip), 
+        .src_ip = host_to_net_u32(device_ip),
         .dst_ip = host_to_net_u32(tcb->remote_ip),
         .zero   = 0,
         .proto  = IP_PROTO_TCP,
@@ -1386,20 +1471,20 @@ tcp_synack(mem_buf *mbuf, tcp_tcb *tcb)
     tcp->csum = tcp_csum(&tcp_pseudo_hdr, tcp, tcp_len);
 
     mbuf->l4_type  = IP_PROTO_TCP;
-    return ipv4_out(mbuf, device_ip, tcb->remote_ip); 
+    return ipv4_out(mbuf, device_ip, tcb->remote_ip);
 }
 
 int
-tcp_finack(mem_buf *mbuf, tcp_tcb *tcb)
+tcp_finack(mem_buf *mbuf, tcp_cb *tcb)
 {
     tcp_hdr *tcp = mem_buf_reserve_l4(mbuf, sizeof(tcp_hdr));
-    tcp->src_port    = tcb->local_port;
-    tcp->dst_port    = tcb->remote_port;
+    tcp->sport    = tcb->local_port;
+    tcp->dport    = tcb->remote_port;
     tcp->seq         = tcb->snd_nxt;
-    tcp->ack_seq     = tcb->rcv_nxt;
-    tcp->data_offset = 5; // 20 bytes, no options
+    tcp->ack     = tcb->rcv_nxt;
+    tcp->data_off = 5; // 20 bytes, no options
     tcp->csum        = 0;
-    tcp->urg_ptr     = 0;
+    tcp->urp     = 0;
     tcp->window      = tcb->recv_window;
     tcp->flags       = 0;
     TCP_HDR_SET_FLAG(tcp, TCP_FLAG_FIN | TCP_FLAG_ACK);
@@ -1414,7 +1499,7 @@ tcp_finack(mem_buf *mbuf, tcp_tcb *tcb)
 
     u16 tcp_len = sizeof(tcp_hdr);
     tcp_ipv4_pseudo_hdr tcp_pseudo_hdr = {
-        .src_ip = host_to_net_u32(device_ip), 
+        .src_ip = host_to_net_u32(device_ip),
         .dst_ip = host_to_net_u32(tcb->remote_ip),
         .zero   = 0,
         .proto  = IP_PROTO_TCP,
@@ -1427,12 +1512,14 @@ tcp_finack(mem_buf *mbuf, tcp_tcb *tcb)
     return ipv4_out(mbuf, device_ip, tcb->remote_ip);
 }
 
-int 
-tcp_in(mem_buf *mbuf)
+int
+tcp_input(mem_buf *mbuf)
 {
+    // TODO(garbu): add some stats
+
     ip_hdr *ip   = mem_buf_l3(mbuf, ip_hdr);
     tcp_hdr *tcp = mem_buf_l4(mbuf, tcp_hdr);
-    u16 tcp_len  = tcp->data_offset * 4; 
+    u16 tcp_len  = tcp->data_off * 4;
 
     tcp_ipv4_pseudo_hdr tcp_pseudo_hdr = {
         .src_ip = host_to_net_u32(ip->src),
@@ -1442,51 +1529,52 @@ tcp_in(mem_buf *mbuf)
         .len    = host_to_net_u16(tcp_len),
     };
 
-    u16 csum = tcp_csum(&tcp_pseudo_hdr, tcp, tcp_len);
-    if (csum != 0) {
-        printf("[TCP IN] Checksum failed\n");
-        return -1;
-    }
+    // Check for short packets
+
+    // u16 csum = tcp_csum(&tcp_pseudo_hdr, tcp, tcp_len);
+    // if (csum != 0) {
+    //     printf("[TCP IN] Checksum failed\n");
+    //     return -1;
+    // }
 
     tcp_header_net_to_host(tcp);
     printf("[TCP IN] ");
     print_tcp_hdr(tcp);
 
-    tcp_tcb *tcb = tcp_tcb_list_find_local_peer(&g_tcb_list, ip->dst, tcp->dst_port);
+    tcp_cb *tcb = tcp_tcb_list_find_local_peer(&g_tcb_list, ip->dst, tcp->dport);
     if (!tcb) {
-        printf("[TCP IN] No TCB found for port: %d\n", tcp->dst_port);
+        warn_sys("tcp_input", "No TCB found for port: %d\n", tcp->dport);
         return -1;
     }
 
     switch (tcb->state) {
     case TCP_STATE_LISTEN: {
-        printf("[TCP IN] LISTEN state\n");
+        debug("tcp_input", "LISTEN state\n");
         if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_SYN)) {
             // First update the TCB
             tcb->state       = TCP_STATE_SYN_RECEIVED;
             tcb->snd_una     = 100;
             tcb->snd_nxt     = 101;
             tcb->snd_wnd     = tcp->window;
-            tcb->remote_port = tcp->src_port;
+            tcb->remote_port = tcp->sport;
             tcb->remote_ip   = ip->src;
-            tcb->rcv_nxt     = tcp->seq + 1; 
+            tcb->rcv_nxt     = tcp->seq + 1;
             tcb->recv_window = tcp->window;
             tcb->irs         = tcp->seq;
             tcb->iss         = 100;
-            tcb->send_window = tcp->window; 
+            tcb->send_window = tcp->window;
             tcb->seg_seq     = tcp->seq;
-            tcb->seg_ack     = tcp->ack_seq;
+            tcb->seg_ack     = tcp->ack;
             tcb->seg_len     = tcp_len;
             tcb->seg_wnd     = tcp->window;
 
-            printf("[TCP IN] SYN, sending SYN-ACK\n");
             tcp_synack(&tx_mbuf, tcb);
         }
     } break;
     case TCP_STATE_SYN_RECEIVED: {
-        printf("[TCP]: SYN_RECEIVED state\n");
+        debug_sys("tcp_input", "SYN_RECEIVED state\n");
         if (!TCP_HDR_IS_FLAG(tcp, TCP_FLAG_ACK)) {
-            printf("[TCP]: Received non-ACK packet (%s) in SYN_RECEIVED state, go back to LISTEN\n", s_tcp_flag_str[tcp->flags]);
+            debug("[TCP]: Received non-ACK packet (%s) in SYN_RECEIVED state, go back to LISTEN\n", s_tcp_flag_str[tcp->flags]);
             tcb->state = TCP_STATE_LISTEN;
             break;
         }
@@ -1494,63 +1582,37 @@ tcp_in(mem_buf *mbuf)
         // TODO(garbu): Check the ACK number, and complete the handshake
 
         tcb->state = TCP_STATE_ESTABLISHED;
-        printf("[TCP]: Connection established\n");
     } break;
     case TCP_STATE_ESTABLISHED: {
-        printf("[TCP]: ESTABLISHED state\n");
+        debug_sys("tcp_input", "ESTABLISHED state\n");
         if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_FIN)) {
-            printf("[TCP]: FIN received, sending FIN-ACK\n");
+            debug_sys("tcp_input", "FIN received, sending FIN-ACK\n");
             tcb->state = TCP_STATE_CLOSE_WAIT;
 
             // Send FIN-ACK
             tcp_finack(&tx_mbuf, tcb);
-        }
-    } break;
-    case TCP_STATE_CLOSE_WAIT: {
-        printf("[TCP]: CLOSE_WAIT state\n");
-        if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_FIN)) {
-            printf("[TCP]: FIN received, sending ACK\n");
-            tcb->state = TCP_STATE_LAST_ACK;
-            // Send ACK
-        }
-    } break;
-    case TCP_STATE_LAST_ACK: {
-        printf("[TCP]: LAST_ACK state\n");
-        if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_ACK)) {
-            printf("[TCP]: ACK received, closing connection\n");
-            tcb->state = TCP_STATE_CLOSED;
-        }
-    } break;
-    case TCP_STATE_FIN_WAIT_1: {
-        printf("[TCP]: FIN_WAIT_1 state\n");
-        if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_FIN)) {
-            printf("[TCP]: FIN received, sending ACK\n");
-            tcb->state = TCP_STATE_CLOSING;
-            // Send ACK
-        }
-    } break;
-    case TCP_STATE_FIN_WAIT_2: {
-        printf("[TCP]: FIN_WAIT_2 state\n");
-        if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_FIN)) {
-            printf("[TCP]: FIN received, sending ACK\n");
-            tcb->state = TCP_STATE_TIME_WAIT;
-            // Send ACK
-        }
-    } break;
-    case TCP_STATE_CLOSING: {
-        printf("[TCP]: CLOSING state\n");
-        if (TCP_HDR_IS_FLAG(tcp, TCP_FLAG_ACK)) {
-            printf("[TCP]: ACK received, closing connection\n");
-            tcb->state = TCP_STATE_CLOSED;
+        } else {
+            // We are in established state, so we should only receive data
+            // Dump the data to the console
+            byte *data = (byte *)tcp + tcp_len;
+            usize data_len = ip->len - ipv4_header_len(ip) - tcp_len;
+            printf("[TCP] DATA: ");
+            print_hex_dump(data, data_len);
         }
     } break;
     default: {
-        printf("[TCP IN] Unknown state\n");
+        warn_sys("tcp_input", "Unknown state: %d\n", tcb->state);
         break;
     }
     }
 
     return 0;
+}
+
+int
+tcp_out(tcp_cb *tcb,  mem_buf *mbuf)
+{
+    bool idle = tcb->snd_max == tcb->snd_una;
 }
 
 int
@@ -1571,11 +1633,11 @@ ipv4_in(mem_buf *mbuf)
         return -1;
     }
 
-    mem_buf_set_l3(mbuf, ipv4_header_len(ip)); 
+    mem_buf_set_l3(mbuf, ipv4_header_len(ip));
 
     switch (ip->proto) {
         case IP_PROTO_ICMP: icmpv4_in(mbuf); break;
-        case IP_PROTO_TCP:  tcp_in(mbuf);    break;
+        case IP_PROTO_TCP:  tcp_input(mbuf);    break;
         default: {
             printf("Unknown IP protocol: %d\n", ip->proto);
         } break;
@@ -1584,12 +1646,12 @@ ipv4_in(mem_buf *mbuf)
     return 0;
 }
 
-int 
+int
 ipv4_out(mem_buf *mbuf, u32 sip, u32 dip)
 {
     // TODO: Route the packet
     // - Check the route table for the destination IP address
-    ip_hdr *ip = mem_buf_reserve_l3(mbuf, IPV4_HDR_LEN_MIN); 
+    ip_hdr *ip = mem_buf_reserve_l3(mbuf, IPV4_HDR_LEN_MIN);
 
     ip->ihl      = IPV4_HDR_LEN_MIN / 4;
 
@@ -1620,7 +1682,7 @@ ipv4_out(mem_buf *mbuf, u32 sip, u32 dip)
     return eth_out(mbuf);
 }
 
-int 
+int
 arp_reply(mem_buf *mbuf, arp_ipv4 *arp_req)
 {
     arp_ipv4 *arp = mem_buf_reserve_l3(mbuf, sizeof(arp_ipv4));
@@ -1699,7 +1761,7 @@ eth_in(mem_buf *mbuf)
     ether->type    = net_to_host_u16(ether->type);
     // printf("[ETH IN] ");
     // print_eth_hdr(ether);
-    mem_buf_set_l2(mbuf, sizeof(eth_hdr)); 
+    mem_buf_set_l2(mbuf, sizeof(eth_hdr));
 
     switch (ether->type) {
         case ETH_PTYPE_IPV4: {
@@ -1716,7 +1778,7 @@ eth_in(mem_buf *mbuf)
     return 0;
 }
 
-int 
+int
 eth_out(mem_buf *mbuf)
 {
     eth_hdr *ether = mem_buf_reserve_l2(mbuf, sizeof(eth_hdr));
@@ -1735,17 +1797,6 @@ eth_out(mem_buf *mbuf)
     return 0;
 }
 
-void
-print_hex_dump(void *data, usize len)
-{
-    u8 *ptr = (u8 *)data;
-    for (usize i = 0; i < len; i++) {
-        printf("%02x ", ptr[i]);
-        if ((i + 1) % 16 == 0) printf("\n");
-    }
-    printf("\n");
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 // Test Thread
 //  - This thread will simulate an application opening a TCP connection
@@ -1753,14 +1804,14 @@ print_hex_dump(void *data, usize len)
 
 // The open_connection function will simulate a client opening a connection
 int
-open_connection(string local_ip, u32 local_port, string remote_ip, u32 remote_port) 
+open_connection(string local_ip, u32 local_port, string remote_ip, u32 remote_port)
 {
     u32 sip, dip;
     string_to_ipv4(local_ip, &sip);
     string_to_ipv4(remote_ip, &dip);
 
     // Check if local port is already in use
-    // tcp_tcb *tcb = tcp_tcb_list_find(&g_tcb_list, 
+    // tcp_tcb *tcb = tcp_tcb_list_find(&g_tcb_list,
     // if (tcb) {
     //     printf("[TCP Client] Connection already open\n");
     //     return -1;
@@ -1779,22 +1830,22 @@ open_connection(string local_ip, u32 local_port, string remote_ip, u32 remote_po
 }
 
 // The create_connection function will simulate a server opening a connection
-int 
+int
 create_connection(string local_ip, u16 local_port)
 {
     u32 ip;
     string_to_ipv4(local_ip, &ip);
 
-    tcp_tcb *tcb = tcp_tcb_list_find_local_peer(&g_tcb_list, ip, local_port);
+    tcp_cb *tcb = tcp_tcb_list_find_local_peer(&g_tcb_list, ip, local_port);
     if (tcb) {
         printf("[TCP Server] Connection already open\n");
         return -1;
     }
 
-    tcb = arena_push_struct(g_arena, tcp_tcb);
+    tcb = arena_push_struct(g_arena, tcp_cb);
     tcb->state      = TCP_STATE_LISTEN;
-    tcb->local_ip   = ip; 
-    tcb->local_port = local_port; 
+    tcb->local_ip   = ip;
+    tcb->local_port = local_port;
     tcb->passive    = true;
     tcp_tcb_list_push(&g_tcb_list, tcb);
 
@@ -1811,14 +1862,19 @@ tcp_server_thread(void *arg)
 
     while (!g_tcp_server_running)   usleep(10000);
 
-    printf("[TCP Server Thread] opening connection\n"); 
+    printf("[TCP Server Thread] opening connection\n");
 
     // Open a connection
     create_connection(from_cstr(DEVICE_ADDRESS), 9999);
 
     while (g_tcp_server_running) {
     }
+
+    return NULL;
 }
+
+///////////////////////////////////////////////////////////////////////////////
+static inline int logger_write(const char *msg, usize len) { UNUSED(len); return fprintf(stderr, "%s", msg); }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Entry Point
@@ -1827,18 +1883,23 @@ main(int argc, char *argv[])
 {
     UNUSED(argc);
     UNUSED(argv);
+
+    logger_set_level(LOG_DEBUG);
+    logger_set_write(logger_write);
+    logger_set_title("uTCP");
+
 #if 0
     string ip_str = str_lit("128.0.0.1");
     u32 ip = 0;
     bool res = string_to_ipv4(ip_str, &ip);
     u32 ip_control = inet_addr(to_cstr(ip_str));
-    printf("%d -> %d\n", ip, ip_control);
+    debug("%d -> %d\n", ip, ip_control);
 
     char ip_cstr[16];
     ipv4_to_cstr(ip, ip_cstr);
-    printf("%s\n", ip_cstr);
+    info("%s\n", ip_cstr);
 
-    printf("sizeof(hdr): %ld\n", sizeof(ip_hdr));
+    debug("sizeof(hdr): %ld\n", sizeof(ip_hdr));
 #else
     ////////////////////////////////////////
     // Initialize
@@ -1995,10 +2056,10 @@ main(int argc, char *argv[])
 #define MBUF_LEN    2048
 #define HEADROOM    (ETH_HDR_LEN + IPV4_HDR_LEN_MAX + TCP_HDR_LEN_MAX)
     byte *rx_mbuf_data = arena_push(main_arena, MBUF_LEN);
-    byte *tx_mbuf_data = arena_push(main_arena, MBUF_LEN); 
+    byte *tx_mbuf_data = arena_push(main_arena, MBUF_LEN);
     rx_mbuf            = mem_buf_init(rx_mbuf_data, MBUF_LEN, HEADROOM);
     tx_mbuf            = mem_buf_init(tx_mbuf_data, MBUF_LEN, HEADROOM);
- 
+
     ////////////////////////////////////////
     // Device Loop
     {
@@ -2025,12 +2086,12 @@ main(int argc, char *argv[])
 
                 if (FD_ISSET(fd, &readfds)) {
                     mem_buf_clear(&rx_mbuf);
-                    rx_mbuf.used = read(fd, mem_buf_buffer(&rx_mbuf), rx_mbuf.len); 
+                    rx_mbuf.used = read(fd, mem_buf_buffer(&rx_mbuf), rx_mbuf.len);
                     if (rx_mbuf.used < 0) {
                         perror("Reading from TUN device");
                         break;
                     }
-                    rx_mbuf.start_off = 0;   
+                    rx_mbuf.start_off = 0;
                     mem_buf_set_l2(&rx_mbuf, ETH_HDR_LEN);
                     nrecv = 1;
                 }
@@ -2052,7 +2113,7 @@ dev_do_tx:
             {
                 if (ntx) {
                     // print_hex_dump(mem_buf_start(&tx_mbuf), tx_mbuf.used);
-                    isize len = write(fd, mem_buf_start(&tx_mbuf), tx_mbuf.used); 
+                    isize len = write(fd, mem_buf_start(&tx_mbuf), tx_mbuf.used);
                     if (len < 0) {
                         perror("Writing to TUN device");
                         break;
